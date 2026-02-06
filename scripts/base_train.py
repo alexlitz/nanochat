@@ -42,6 +42,8 @@ parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (e
 # FP8 training
 parser.add_argument("--fp8", action="store_true", help="enable FP8 training (requires H100+ GPU and torchao)")
 parser.add_argument("--fp8-recipe", type=str, default="tensorwise", choices=["rowwise", "tensorwise"], help="FP8 scaling recipe: tensorwise (faster, recommended) or rowwise (more accurate but slower)")
+# 2:4 Sparsity
+parser.add_argument("--sparse", action="store_true", help="enable 2:4 semi-structured sparsity for MLP layers (requires Ampere+ GPU)")
 # Model architecture
 parser.add_argument("--depth", type=int, default=20, help="depth of the Transformer model")
 parser.add_argument("--aspect-ratio", type=int, default=64, help="model_dim = depth * aspect_ratio")
@@ -240,6 +242,11 @@ if args.fp8:
         num_skipped = sum(1 for m in model.modules() if isinstance(m, nn.Linear)) - num_fp8_layers
         print0(f"✓ FP8 training enabled ({args.fp8_recipe} scaling) - converted {num_fp8_layers} layers, skipped {num_skipped} (dims not divisible by 16)")
 
+# Note on NVFP4: NVIDIA's 4-bit floating point format (nvfp4) for training requires Blackwell
+# architecture (GB300) which provides 7x speedup over Hopper for matrix multiplication.
+# As of early 2025, nvfp4 training support is not yet available in PyTorch/torchao.
+# See: https://developer.nvidia.com/blog/nvfp4-trains-with-precision-of-16-bit-and-speed-and-efficiency-of-4-bit/
+
 # Context manager to temporarily disable FP8 so that model evaluation remains in BF16
 @contextmanager
 def disable_fp8(model):
@@ -286,6 +293,32 @@ def disable_fp8(model):
         # Restore Float8Linear modules
         for parent, attr_name, fp8_module in fp8_locations:
             setattr(parent, attr_name, fp8_module)
+
+# -----------------------------------------------------------------------------
+# 2:4 Sparsity initialization (has to be done before torch.compile)
+
+if args.sparse:
+    if device_type != "cuda":
+        print0("Warning: 2:4 sparsity requires CUDA, ignoring --sparse flag")
+    else:
+        from torchao.sparsity.training import SemiSparseLinear, swap_linear_with_semi_sparse_linear
+        import torch.nn as nn
+
+        # Build filter dict for MLP layers only (c_fc and c_proj)
+        # SemiSparseLinear requires dimensions divisible by certain values for hardware acceleration
+        sparse_config = {}
+        for name, mod in model.named_modules():
+            if isinstance(mod, nn.Linear) and '.mlp.' in name:
+                # Check dimension requirements for 2:4 sparsity (typically divisible by 16)
+                if mod.in_features % 16 == 0 and mod.out_features % 16 == 0:
+                    sparse_config[name] = SemiSparseLinear
+
+        if sparse_config:
+            swap_linear_with_semi_sparse_linear(model, sparse_config)
+            num_sparse_layers = len(sparse_config)
+            print0(f"✓ 2:4 sparsity enabled - converted {num_sparse_layers} MLP layers to SemiSparseLinear")
+        else:
+            print0("Warning: No eligible MLP layers found for 2:4 sparsity (dimensions not divisible by 16)")
 
 # -----------------------------------------------------------------------------
 # Compile the model
@@ -546,6 +579,8 @@ get_report().log(section="Base model training", data=[
         "warmup_ratio": args.warmup_ratio,
         "warmdown_ratio": args.warmdown_ratio,
         "final_lr_frac": args.final_lr_frac,
+        "FP8 enabled": args.fp8,
+        "2:4 Sparsity enabled": args.sparse,
     },
     { # stats about training outcomes
         "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
